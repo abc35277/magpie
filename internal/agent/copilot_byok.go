@@ -4,15 +4,18 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/gateway"
 )
 
 // Copilot CLI takes its own model providers from providers.json (BYOK, `copilot
 // help providers`; docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-byok-models):
 //
 //	{"providers": [{"name", "type", "baseUrl", "apiKey", "wireApi"}],
-//	 "models":    [{"id", "provider", "name", "maxPromptTokens", "maxOutputTokens", ...}]}
+//	 "models":    [{"id", "provider", "name", "maxPromptTokens", "maxOutputTokens",
+//	                "capabilities": {"supports": {"reasoning_effort": [...levels]}}, ...}]}
 //
 // and a model is picked as <provider>/<id> (settings.json "model"). It needs
 // no GitHub sign-in. magpie owns the entry named magpie in providers and the
@@ -79,6 +82,28 @@ func copilotProvider(path string) map[string]any {
 	return map[string]any{}
 }
 
+// copilotEfforts are a model's levels for the effort picker Copilot's /model
+// offers beside the model: the ones its catalog lists, weakest first, each
+// a level Copilot names (its config-dir reference takes reasoning_effort as
+// the levels a model supports, none, minimal, low, medium, high, xhigh and
+// max). A level Copilot doesn't name — Codex's ultra, a vendor's own word —
+// is left out: the gateway fits what is asked to the model's own nearest
+// (fitEffort), so a picker level of Copilot's covers it. nil for a model
+// with no levels, an array left out being Copilot's word for its own
+// defaults (#5885).
+func copilotEfforts(efforts []string) []string {
+	var out []string
+	for _, e := range gateway.ByStrength(efforts) {
+		switch e {
+		case "none", "minimal", "low", "medium", "high", "xhigh", "max":
+			if !slices.Contains(out, e) {
+				out = append(out, e)
+			}
+		}
+	}
+	return out
+}
+
 // copilotBlock is magpie's provider and its models for the gateway at url
 // (ending in /v1), as the catalog lists them for Copilot. The wire is
 // OpenAI's chat completions, which the gateway translates for every model.
@@ -89,6 +114,9 @@ func copilotBlock(url, key string) (map[string]any, []map[string]any) {
 		e := map[string]any{"id": m.ID, "provider": magpieID}
 		if m.Name != "" {
 			e["name"] = m.Name
+		}
+		if levels := copilotEfforts(m.Efforts); len(levels) > 0 {
+			e["capabilities"] = map[string]any{"supports": map[string]any{"reasoning_effort": levels}}
 		}
 		if out := maxTokens(m); out > 0 {
 			e["maxOutputTokens"] = out

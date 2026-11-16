@@ -3,11 +3,14 @@ package agent
 import (
 	"encoding/json"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // providers is providers.json at path, parsed.
@@ -163,4 +166,100 @@ func TestCopilotSyncCheckAndEnv(t *testing.T) {
 	if got := copilot(home, filepath.Join(home, ".config")).Path; got != filepath.Join(home, "ch", "settings.json") {
 		t.Fatalf("COPILOT_HOME ignored: %s", got)
 	}
+}
+
+// #5885: Copilot's /model offers its effort picker only to a model whose
+// entry declares capabilities.supports.reasoning_effort, which magpie's
+// never did — the effort stood for every session, set from magpie alone.
+// Each of magpie's models now declares the levels its catalog lists,
+// weakest first, each a level Copilot names; a word it doesn't — Codex's
+// ultra, a vendor's own — is left out, the gateway fitting what is asked
+// to the model's own nearest, and a model with no levels declares none,
+// Copilot's own defaults standing.
+func TestCopilotEffortsInProvidersJSON(t *testing.T) {
+	cp, provs := copilotSandbox(t)
+	// the models of a provider are the user's picks of its list; plain is
+	// picked with no levels of its own listed
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k",
+		Models: []string{"pro", "flash", "plain"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.SaveLive("deepseek", "https://api.deepseek.com/v1", []catalog.Model{
+		{ID: "pro", Name: "pro", Efforts: []string{"ultra", "none", "low", "high", "max"}},
+		{ID: "flash", Name: "flash", Efforts: []string{"xhigh", "medium"}},
+		{ID: "plain", Name: "plain"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cp.Field("model").Set("magpie/deepseek/pro"); err != nil {
+		t.Fatal(err)
+	}
+	_, ms, _ := copilotParsed(t, provs)
+	levels := func(id string) []string {
+		t.Helper()
+		for _, m := range ms {
+			if m["id"] != id {
+				continue
+			}
+			c, _ := m["capabilities"].(map[string]any)
+			s, _ := c["supports"].(map[string]any)
+			l, _ := s["reasoning_effort"].([]any)
+			var out []string
+			for _, v := range l {
+				out = append(out, v.(string))
+			}
+			return out
+		}
+		t.Fatalf("no model %s written:\n%s", id, readFile(provs))
+		return nil
+	}
+	if got, want := levels("deepseek/pro"), []string{"none", "low", "high", "max"}; !slices.Equal(got, want) {
+		t.Fatalf("pro's levels %q, want %q\n%s", got, want, readFile(provs))
+	}
+	if got, want := levels("deepseek/flash"), []string{"medium", "xhigh"}; !slices.Equal(got, want) {
+		t.Fatalf("flash's levels %q, want %q\n%s", got, want, readFile(provs))
+	}
+	for _, m := range ms {
+		if m["id"] == "deepseek/plain" {
+			if _, has := m["capabilities"]; has {
+				t.Fatalf("a model with no levels declares capabilities:\n%s", readFile(provs))
+			}
+			return
+		}
+	}
+	t.Fatalf("no model deepseek/plain written:\n%s", readFile(provs))
+}
+
+// What the user hand-patched into a model of magpie's — capabilities among
+// them — magpie's next write takes back: its entries are its own, and the
+// adapter is the lasting place for the field (#5885).
+func TestCopilotEffortsRewrittenOnSync(t *testing.T) {
+	cp, provs := copilotSandbox(t)
+	if err := catalog.SaveLive("deepseek", "https://api.deepseek.com/v1", []catalog.Model{
+		{ID: "pro", Name: "pro", Efforts: []string{"low", "high"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cp.Field("model").Set("magpie/deepseek/pro"); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, provs, `{"providers":[{"name":"magpie","type":"openai","baseUrl":"http://127.0.0.1:1/v1","apiKey":"x"}],`+
+		`"models":[{"id":"deepseek/pro","provider":"magpie","name":"pro","capabilities":{"supports":{"reasoning_effort":["low","medium","high"]}}}]}`)
+	if err := cp.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	_, ms, _ := copilotParsed(t, provs)
+	for _, m := range ms {
+		if m["id"] != "deepseek/pro" {
+			continue
+		}
+		c, _ := m["capabilities"].(map[string]any)
+		s, _ := c["supports"].(map[string]any)
+		l, _ := s["reasoning_effort"].([]any)
+		if len(l) != 2 || l[0] != "low" || l[1] != "high" {
+			t.Fatalf("sync left the hand-patched levels %v:\n%s", l, readFile(provs))
+		}
+		return
+	}
+	t.Fatalf("sync left no model deepseek/pro:\n%s", readFile(provs))
 }
